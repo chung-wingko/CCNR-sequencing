@@ -1,0 +1,491 @@
+---
+title: "Pre-Taxonomic Assignment ITS Pipeline (1/2)"
+author: "Chung-Wing Ko"
+date: "1 Feb 2024"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Introduction
+
+This pipeline is for generating ASVs from the ITS fastq files from SCLESCE. This uses DADA2, which is not the only way to way analyse (other examples such as QIME, etc) but this workflow is accessible.
+
+Before starting, we need to set up miniconda, bioconda, and cutadapt on your laptop. Follow this tutorial: https://cutadapt.readthedocs.io/en/stable/installation.html
+
+Once cutadapt is installed, for Mac system, you'll need to reactivate it each working session with: *conda activate cutadaptenv*
+You can check that it worked with this command: *cutadapt --version*
+
+Also, download all fastq files and set them in one folder on your computer. Set the working directory to this folder (see code below).
+
+```{r}
+#install packages
+# install.packages("BiocManager")
+# BiocManager::install("dada2")
+# install.packages("Biostrings")
+# install.packages("ggplot2")
+# if(!requireNamespace("BiocManager")){
+ # install.packages("BiocManager")
+#}
+# BiocManager::install("phyloseq")
+# install.packages("ShortRead")
+
+#loading packages
+library(dada2)
+library(Rcpp)
+library(Biostrings)
+library(ggplot2)
+library(phyloseq)
+library(ShortRead)
+library(dplyr)
+
+#set working directory
+setwd("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial")
+path <- setwd("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial")
+#check that this worked. you should see the file names
+list.files(path)
+```
+
+Before starting the DADA2 pipeline, let's look at the raw data to gut check if the sequencing worked and makes sense. 
+
+Find one of the files in your raw data folder and open one of the up with a text editing software program. One program is BBEdit, which you can download here: *https://www.barebones.com*. Another option is Sublime text, which works for Mac & PC: *https://www.sublimetext.com*. 
+
+Example sequencing file: 
+
+\@M03154:424:000000000-C9N4D:1:1101:21404:1851 1:N:0:TCTGAGAC+GCTTAAGC
+GCGGTGCTAGGTCATTTAGAGGAAGTAAAAGTCGTAACAAGGTTTCCGTAGGTGAACCTGCGGAAGGATCATTACCGAGTGCGGGAACCCAGTCGGGTCCCAATCTCCCACCCGTGTCTACCACACCTAGTGTTGCTTTGGCGGGCCCACTCCTCCGGTGTTCCGCCGGGGGGGTCGTCCCGGGGCGCGGTGTGCCCCCGGGGCCCGTGCCCGCCAGAGGCACTCACTGTGAACGCTTTTGTGAATGCGAGGATTGTCTGAGTGACGAAATGCAATCGTTCAAAACTTTCAACAATGGATC
++
+CCCCCGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGFGGGGGFGFGGGGGGGGGCAFGGGGGGGFFGGGGGGGGGEFGGGGGGGGGGCEGGGG5EGGGDGGGGGGGGGGGGGGGGGGGGGGGDCGGGGGGGDGGG=EFF?FGGGGFBGFBCBFFFFFFBGGFGD<B@?AFFF4=9F4<?BE0<B@?8>BF??FFF?AF24><>AFFFFFFFB<),
+
+The first line starting with the @ is the ID of the sequencer (instrument name, location of the read on the flow cell, and barcode used). The second line starting with the + is the actual DNA sequence. The third line following the second + is the quality score. Quality scores range from 0-40 and are log based. 
+
+Copy one of sequence lines and paste it into NCBI Blast (Nucleotide): *https://blast.ncbi.nlm.nih.gov/Blast.cgi*. Keep an eye out for taxonomy identified, and location (does this all make biological sense?) as well as how high of a confidence the match is.
+
+```{r}
+#plot quality profile of one file
+plotQualityProfile("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial/ITSW15SE_S18_R1_001.fastq.gz")
+
+#reverse read
+plotQualityProfile("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial/ITSW15SE_S18_R2_001.fastq.gz")
+
+#The distribution of quality scores at each position is shown as a grey-scale heat map, with dark colors corresponding to higher frequency. The plotted lines show positional summary statistics: green is the mean, orange is the median, and the dashed orange lines are the 25th and 75th quantiles.
+```
+
+Beginning of the quality graph shows the primer/adapter, always lower quality than the rest. The quality drops off as the read continues, but the forward and reverse reads will overlap and makes up for this drop. In general, your cutoff (comes later) will depend on how high quality your sample is, how much of your data you're okay with losing. 
+
+Generally, we want to check multiple quality profiles to get a sense of the quality trends. 
+
+# Pre-filtering
+
+## Removing fwd/rev reads that don't have a match
+
+Forward and reverse fastq filenames have format: *SAMPLENAME_R1_001.fastq.gz* and S*AMPLENAME_R2_001.fastq.gz*. Make sure to change following code if this pattern changes (which may be the case between different sequencing facilities).
+
+```{r}
+# this line identifies the pattern of the files, sorting into fwd and reverse reads, and creates folders sorting the files
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq.gz", full.names = TRUE)) #if set to be FALSE, then working directory must contain the files
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq.gz", full.names = TRUE))
+
+#remove any forward files that don't have reverse counterparts, and vise versa
+#filterAndTrim (later step) will throw an error if fnFs and fnRs have any mismatches
+basefilenames_Fs <- sub("_R1_001.fastq.gz","",basename(fnFs))
+basefilenames_Rs <- sub("_R2_001.fastq.gz","",basename(fnRs))
+rm_from_fnFs <- basefilenames_Fs[which(!(basefilenames_Fs %in% basefilenames_Rs))]
+rm_from_fnRs <- basefilenames_Rs[which(!(basefilenames_Rs %in% basefilenames_Fs))]
+
+for(name in rm_from_fnFs) {
+  print(paste(name, "does not have a reverse-reads counterpart. Omitting from this analysis."))
+  fnFs <- fnFs[-which(fnFs == paste0(path, "/", name, "_R1_001.fastq.gz"))]
+}
+for(name in rm_from_fnRs) {
+  print(paste(name, "does not have a forward-reads counterpart. Omitting from this analysis."))
+  fnRs <- fnRs[-which(fnRs == paste0(path, "/", name, "_R2_001.fastq.gz"))]
+}
+```
+
+## Primers
+
+First, identify primers. Some sequencing facilities will automatically remove primers but often at extra cost.
+
+```{r}
+#these are the ITS1FKYO1 & ITS2KYO2 primers
+#Biostrings works w/ DNAString objects rather than character vectors
+FWD <- DNAString("CTHGGTCATTTAGAGGAASTAA")
+REV <- DNAString("TTYRCTRCGTTCTTCATC")
+# Y/H/S etc are base pairs that can be multiple options
+```
+
+### Get all orientations of primers, just to be safe
+
+During sequencing, primers will end up in all orientations. We want to remove all of these in order to get our true sequences.
+
+```{r}
+#creating a function to identify all versions of primers (reversed, complement, etc) to remove all primers
+allOrients <- function(primer) {
+  # Create all orientations of the input sequence
+  require(Biostrings)
+  dna <- primer
+  orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+               RevComp = reverse(complement(dna)))
+  return(sapply(orients, toString))  #convert back to character vector
+}
+
+#applying function to the primers
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+```
+
+There is another pipeline for primer removal for 16S on the DADA2 website.Technically can use this script for 16S also, just not necessary (more standard and less variability compared to ITS). 
+
+### Remove all Ns
+
+Ns occur when there are unidentified bases. These are low quality reads, so we're aiming to remove them all. If this drops too many reads, you can adjust this to allow more Ns, but the quality of reads will be lower. 
+
+```{r}
+#put N-filterd files in filtN/ subdirectory (organisational step)
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) 
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+#run filtering step
+#maxN is command to set how many Ns are acceptable
+filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE) 
+```
+
+DADA2 works with ASVs rather than OTUs (now considered more outdated). This is still debated, and you can check literature for what's more established or best for your questions and your database. 
+If data quality is rly bad, OTUs may be preferred due to a lower 97% threshold to group species, but generally nowadays most ppl use ASVs, which separates species more strictly, which relies on more high quality reads (aka taking out all Ns, strict filtering criteria). 
+
+### Quantifying primers
+
+We are now ready to count the number of times the primers appear in the forward and reverse read, while considering all possible primer orientations. Identifying and counting the primers on one set of paired end FASTQ files is sufficient, assuming all the files were created using the same library preparation, so we’ll just process the first sample.
+
+This step is used to compare how many primers were removed after the cutadapt step, cause we want to make sure that majority of primers are removed. 
+
+```{r}
+#create another function to quantify how many primers we have in our sequences
+primerHits <- function(primer, fn) {
+  # Counts number of reads in which the primer is found
+  nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+  return(sum(nhits > 0))
+}
+
+#checking for one sample, how many primers/versions of primers there are to remove
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+      FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+      REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+      REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+
+#If you see the reverse-complement of the forward primer in the reverse reads (cells [2,4] and [3,4]), it's because the ITS region is short and it is reading part of the forward primer.
+```
+
+### Cutadapt
+
+First, need to tell R where path to cutadapt is in your computer. You can use *which cutadapt* in terminal (Mac) to find this path.
+
+```{r}
+#set path
+cutadapt <- "/Users/chungwingko/miniconda3/envs/cutadaptenv/bin/cutadapt"
+#run shell commands from R
+system2(cutadapt, args = "--version")
+
+#file path
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+# another directory for cut
+fnFs.cut <- file.path(path.cut, basename(fnFs.filtN))
+fnRs.cut <- file.path(path.cut, basename(fnRs.filtN))
+
+#this chunk may need to be reevaluated based on what primers and regions you're working with, but generally okay for standard ITS
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+#trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC) 
+#trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC) 
+
+#run Cutadapt
+for(i in seq_along(fnFs.filtN)) {
+  # for(i in 1:10) {
+  system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 2, 
+         # -n 2 required to remove FWD and REV from reads
+         "-m", 10, #minimum number of base pairs after cutting primers out
+        "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+        fnFs.filtN[i], fnRs.filtN[i], # input files; fnFs.filtN replaced by fnFs.filtN, etc.
+        "--minimum-length", "1")) # min length of cutadapted reads: >0 
+}
+
+#count primers in first post-cutadapt sample (should all be 0, but actually it's okay if a few are left):
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+      FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]), 
+      REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]), 
+      REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+
+#since they are zero, skip step to remove other orientations of primers
+#in practice, it's fine to have a few left (compare before and after to check a vast majority of primers are gone)
+
+#more organisational stuff for cut files
+cutFs <- sort(list.files(path.cut, pattern = "_R1_001.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "_R2_001.fastq.gz", full.names = TRUE))
+```
+
+# Filtering step
+
+```{r}
+#extract sample names (may have to change this based on company and how ur sample names are formatted)
+get.sample.name <- function(fname) {
+  paste(strsplit(basename(fname), split="_")[[1]][1:2], collapse="")
+}
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+
+#inspect read quality profiles of forward reads #1-2
+plotQualityProfile(cutFs[1:2])
+#can see the primers were cut alr
+
+#inspect read quality profiles of reverse reads #1-2
+plotQualityProfile(cutRs[1])
+
+#assigning the filenames for the output of the filtered reads to be stored as fastq.gz files.
+filtFs <- file.path(path, "filtered", basename(fnFs.filtN))
+filtRs <- file.path(path, "filtered", basename(fnRs.filtN))
+
+#filtering step
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs, maxN = 0, maxEE = c(2, 2), truncQ = 11, minLen = 100, rm.phix = TRUE, compress = TRUE, multithread = TRUE)  # on windows, set multithread = FALSE
+# maxN = 0 (to filter out all sequences with Ns)
+# maxEE = max expected errors (2,2 means 2 for forward, 2 for reverse). the higher error you allow, the more reads you'll retain. sometimes you also may change the error rate differently for fwd and reverse. run through all first, come back and adjust if needed. this is a tool created by the software, hard to explain in numerical terms
+# truncQ = remove base pairs for every sequence that is lower than this parameter (range up to 40)
+# minLen = minimum length of sequence (what's reliable for taxonomical classification, post cutting and dropping primers) - 50 is standard
+# minQ after all these steps, drop the whole sequence if there are nucleotides < this parameter
+
+head(out)
+# look at the rate of retention, which really depends on your goal (the rarer, the more reads you want to ask from the facility so you can drop more)
+# look at both the number of reads and the rate of in and out
+# ITS - normally at least 50k reads, keeping more is better (100k reads would be safe, new environment and we don't know diversity)
+# maybe 50% of the amt in is okay -- go look at literature
+# usually will drop between 10-50%
+
+#look at the profiles again
+plotQualityProfile(filtFs[1])
+
+#more organisation
+filtFs.out <- list.files(paste(path, "filtered", sep="/"), pattern="_R1_001.fastq.gz", full.names=TRUE)
+filtRs.out <- list.files(paste(path, "filtered", sep="/"), pattern="_R2_001.fastq.gz", full.names=TRUE)
+```
+
+# Error rates
+
+This is the most important part of DADA2 software, as it interprets the difference between which errors are biological changes vs which are sequencing errors. 
+
+```{r}
+#learn the error rates
+errF <- learnErrors(filtFs.out, multithread = TRUE)
+errR <- learnErrors(filtRs.out, multithread = TRUE)
+
+#visualize estimated error rates
+plotErrors(errF, nominalQ = TRUE)
+#not much you can do, just the software learning what the error rates are 
+#if the error rates are so bad, maybe issue with sequencing facility (ask for resequencing, paid for service)
+
+#dereplicate identical reads (separating potential diff species with unique sequences)
+derepFs <- derepFastq(filtFs.out, verbose = TRUE)
+derepRs <- derepFastq(filtRs.out, verbose = TRUE)
+#name the derep-class objects by the sample names
+get.sample.name <- function(fname) {
+  paste(strsplit(basename(fname), "_")[[1]][1:2], collapse="_")
+}
+
+sample.names <- unname(sapply(filtFs.out, get.sample.name))
+
+#DADA2's core sample inference algorithm
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+```
+
+# Merge reads
+
+Sometimes if there's an issue with the merge, some use the forward read only. Possible issues: cut too much, primer selection, library prep, etc. Primer selection is really important prior to PCR, as these reads need to merge properly. Prior to cutting, you should know how much overlap you have, make sure your cleaning didn't remove too much overlap if these are standard primers. 
+
+```{r}
+#merge
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE,trimOverhang = TRUE)
+
+#construct sequence table 
+seqtab <- makeSequenceTable(mergers)
+#understand dimensions of matrix, this is the # of ASVs (species kinda)
+dim(seqtab)  
+#can check literature to see if this number makes sense (re: species diversity)
+table(nchar(getSequences(seqtab)))
+# check literature or kabir to know what length is normal given these primers
+
+#if you know what range of base pairs your sequences should be, you can specify
+# seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 100:450] 
+#basically this is like extracting gel based on range of known bp length, plus some recommendations from documentation
+```
+
+# Remove chimeras
+
+Chimeras are basically any artificial pairings, introduced during the sequencing process. You can check DADA2 documentation to see how they define chimeras (sometimes they include past mistakes, sometimes no).
+
+```{r}
+#remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+#checking how many chimeras there were
+sum(seqtab.nochim)/sum(seqtab)
+
+row.names(seqtab.nochim)<-sample.names
+
+#save file
+saveRDS(seqtab,"seqtab.R1.RDS")
+saveRDS(seqtab.nochim,"seqtab.nochim.R1.RDS")
+
+#inspect distribution of sequence lengths
+hist(nchar(getSequences(seqtab.nochim)))
+```
+
+# Table for reads
+
+Checking along the pipeline, how many reads were dropped at each processing step. This is a quality control step to check there's no major drops and you're comfortable with retention rate.
+
+```{r}
+#track reads through pipeline
+getN <- function(x) sum(getUniques(x))
+
+#format out to accommodate dropped samples
+raw.sample.names <- unname(sapply(row.names(out), get.sample.name))
+
+track <- cbind(sapply(dadaFs, getN), sapply(dadaRs, getN), 
+               sapply(mergers, getN), rowSums(seqtab.nochim))
+
+track2<-cbind(out,track[match(row.names(out),row.names(track)),])
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+
+colnames(track2) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+
+#write csv
+write.csv(track2,"crap_ASV_fungi_summary.csv")
+
+rownames(track2) <- sample.names
+head(track)
+```
+
+# Assign taxonomy
+
+Note: do this in a better computer lol. You can run on a server also, otherwise leave plugged in and overnight/over weekend.
+
+Processing can take a while, depending on how many samples you have, RAM of your compter, and which database you use (fungal vs. all eukaryotes). Regarding database, using the just fungal database will process faster, but using the eukaryote database will allow you to remove all samples that are not actually fungi (otherwise will be classified as unknown in future analyses). 
+
+```{r, eval = FALSE}
+#import your reads
+seqtab.nochim<-readRDS("seqtab.nochim.R1.RDS")
+```
+
+## Import UNITE database
+
+This is a standard reliable database for fungi which is very up to date, updates every year (so make sure you publish with most up to date data). 
+
+For 16S, most people use *SILVA* - bacteria or archaea - which is updated every year. Another option is *GREENGENES*, but this stopped being updated a while ago so it's outdated but some ppl still use.
+
+```{r, eval = FALSE}
+#import database (save this as a file in your folder)
+unite.ref <- "UNITE_public_all_29.11.2022.fasta"
+
+#this step takes A LONG TIME! 
+taxa <- assignTaxonomy(seqtab.nochim, unite.ref, multithread = TRUE, outputBootstraps = TRUE, minBoot = 50)
+
+#once this processes: a lot of things will be unclassified, which is normal
+#note that journals will require raw data in NBCI or smth similar
+
+#removing sequence rownames for display only
+taxa.print <- taxa  
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+#save file
+saveRDS(taxa,"CRAP_ITS2_taxa_23MAY23.RDS")
+```
+
+## Add functional guild data
+
+This is an overview of functional traits to give a better sense of general environment (used alongside abundance data). 
+
+Remember that this is all based on assumptions, as our data is based on DNA and what organisms exist, not what they are doing. We can't measure activities (would need proteins/enzymes) and we can't monitor behavioral changes based on environ parameters. 
+
+Also, there are some differences in which functional traits will be given based on which database is being used.
+
+```{r, eval = FALSE}
+#import your taxonomy file
+taxa<-readRDS('CRAP_ITS2_taxa_23MAY23.RDS')
+
+#importing database (save this in your folder to import)
+fungal.traits.database<-read.csv('FungalTraits1.2_ver_16Dec_2020.csv') #this takes a little while
+
+tax.table<-data.frame(taxa)
+Genus<-gsub("g__","",tax.table$tax.Genus)
+traits_table<-fungal.traits.database[match(Genus,fungal.traits.database$GENUS),]
+tax.trait.table<-cbind(tax.table,traits_table)
+```
+
+# Saving files (Kabir vs. Andressa)
+
+```{r, eval = FALSE}
+# Kabir
+#save ASV table and taxonomic table as RDS files to hand off to dada2_to_phyloseq.R
+saveRDS(seqtab.nochim, "crap_ASV_seqtab_23MAY23.Rds")
+saveRDS(taxa, "crap_ASV_taxa_23MAR23.Rds")
+saveRDS(tax.trait.table, "crap_ASV_taxaTraits_23MAY23.Rds")
+
+# Andressa
+
+#organize the ASV table
+asv_seqs <- colnames(seqtab.nochim)
+asv_headers <- vector(dim(seqtab.nochim)[2], mode="character")
+for (i in 1:dim(seqtab.nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+#fasta file as raw data so you can come back to it
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, "ASVs.fa")
+
+#abundance data
+asv_tab <- t(seqtab.nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(asv_tab, "ASVs_counts.tsv", sep="\t", quote=F, col.names=NA)
+
+#taxonomic information
+asv_tax <- taxa
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "ASVs_tax.tsv", sep="\t", quote=F, col.names=NA)
+
+#merge all info together (taxonomic and abundance)
+#this will be your starting point for future data analysis
+asv_tax_counts <- merge(asv_tax, asv_tab, by=0)
+write.table(asv_tax_counts, "ASVs_tax_counts.tsv", sep="\t", quote=F, col.names=NA)
+```
+
+# Other notes
+
+Looking at the taxonomic classifications:
+If a lot is classified to v high levels of taxonomy (for ex: no phylla), a few options:
+1. Can either remove all these samples (often shown not to be fungal -- some paper)
+2. Can run with whole eukaryotic database, remove known contaminants
+3. Can look at sequences (common ones) and BLAST them to see what they are to choose to remove
+
+Differences in pipeline for bacteria vs fungi
+1. Don't need cutadapt for bacteria (can use a set window of basepairs instead)
+2. Use diff database (SILVA instead of UNITE)
+3. Two steps for assigning bacterial species rather than 1 step for fungi
+4. Functional analysis is different
+    a. piecrust???? best way but data can be overwhelming (full list of genes with IDs, need to know how to evaluate that, how genes translate to diff pathways)
+    b. can be super specific with what functional groups youre interested in, what genes youll focus on
+    c. faprotax - matching database of functional traits w your data
+
