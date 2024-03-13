@@ -1,0 +1,505 @@
+---
+title: "ITS Visualisations"
+author: "Chung-Wing Ko"
+date: "4 Feb 2024"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+#install
+# devtools::install_github("KarstensLab/microshades")
+# devtools::install_github("mikemc/speedyseq")
+
+#load libraries
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(microshades)
+library(speedyseq)
+library(RColorBrewer)
+library(vegan)
+library(BiodiversityR)
+library(tibble)
+library(metacoder)
+
+setwd("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial/Post_phyloseq")
+path <- setwd("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial/Post_phyloseq")
+```
+
+## Alpha Diversity
+
+```{r}
+#load phyloseq
+ITS_phyloseq_rarefied <- readRDS("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial/Post_phyloseq/physeq_cleaned_ITS")
+ITS_phyloseq <- readRDS("/Users/chungwingko/Desktop/SCELSCE_Sequencing/ITS_Trial/ITS_phyloseq_filtered.Rds")
+
+#convert phyloseq object to dataframe
+ITS_phyloseq.df <- psmelt(ITS_phyloseq)
+ITS_phyloseq_rarefied.df <- psmelt(ITS_phyloseq)
+
+# alpha diversity
+#estimate richness based on samples
+funDIV <- estimate_richness(ITS_phyloseq)
+
+#export/save alpha diversity table
+write.csv(funDIV, "alphaDIV_Fungi.csv")
+
+#plot alpha diversity using non-normalised (not rarefied)
+plot_richness(ITS_phyloseq, x = "Forest", measures = c("Observed")) + theme_bw() + xlab("") + theme(axis.text.x = element_text(angle = 45)) + labs(title = "Fungal Community") + labs(fill = "Sample") + geom_boxplot()
+
+#add sample column
+funDIV2 <- rownames_to_column(funDIV)
+colnames(funDIV2)[1] <- "Sample"
+
+forest <- ITS_phyloseq.df %>% select("Sample", "Forest") 
+funDIV2 <- funDIV2 %>% right_join(forest)
+funDIV2 <- funDIV2 %>% unique()
+
+# add facet variable
+funDIV2$title <- "Fungal Richness"
+# stats
+anova_alpha2 <- aov(Observed ~ Forest, funDIV2)
+summary(anova_alpha2)
+library(ggpubr)
+my_comps <- list(c("HF", "MDF"), c("HF", "PSF"), c("HF", "S"), c("MDF", "S"), c("MDF", "PSF"), c("PSF", "S"))
+
+# plot w/ stats
+ggplot(funDIV2, aes(x=Forest, y=Observed, color=Forest)) + 
+  geom_boxplot() + theme_bw() + scale_color_manual(values=c("black", "red", "darkslategray4", "goldenrod3")) + 
+  xlab("Forest Type") + theme(axis.text.x = element_text(size = 12, face = "bold")) + theme(legend.position = "none") + 
+  theme(axis.text.y = element_text(size = 12, face = "bold")) + facet_grid(~title) + theme(axis.title.x = element_text(size = 16, face="bold")) +
+  theme(strip.text = element_text(size = 14, face = "bold", color="white")) + theme(axis.title.y = element_text(size = 16, vjust = 1.5, face="bold")) +
+  theme(strip.background = element_rect(fill = "burlywood4")) + stat_compare_means(comparisons = my_comps)
+
+#anova test
+anova_result <- aov(Observed ~ Forest, funDIV2)
+summary(anova_result)
+
+#tukey test
+library(agricolae)
+tukey_result <- HSD.test(anova_result, "Forest", group = TRUE)
+print(tukey_result)
+```
+
+## Taxonomy plot with metacoder + relative abundance plots
+
+```{r}
+library(metacoder)
+
+#create ASV-TAX table
+taxa_names(ITS_phyloseq_rarefied) <- paste0("Seq", seq(ntaxa(ITS_phyloseq_rarefied)))
+ASV_FUN <- data.frame(otu_table(ITS_phyloseq_rarefied))
+TAX_FUN <- data.frame(tax_table(ITS_phyloseq_rarefied))
+t_ASV_FUN <- t(ASV_FUN)
+FUN_ASV_TAX <- merge(t_ASV_FUN, TAX_FUN, by = "row.names")
+
+#create the combined OTU table plus taxonomy string metacoder needs
+
+#read it in using phyloseq object
+tax_table(ITS_phyloseq_rarefied)<-tax_table(ITS_phyloseq_rarefied)[,1:32]
+x1<-parse_phyloseq(ITS_phyloseq_rarefied) #this takes ages
+
+#calculate relative abundance
+x1$data$abund_data <- calc_obs_props(x1, "otu_table")
+
+#calculate total abundance by forest type
+x1$data$Forest<-calc_taxon_abund(x1, "abund_data",groups=x1$data$sample_data$Forest)
+
+### make taxonomy plots
+# Make sure we use functions from correct package
+transform <- microbiome::transform
+
+# Merge rare taxa to speed up examples
+pseq <- microbiome::transform(ITS_phyloseq_rarefied, "compositional")
+
+#save rarefied + transformed rds
+saveRDS(pseq, "Fungi-Rarefied-Transf.rds")
+
+pseq <- aggregate_rare(pseq, level = "Order", detection = 1/100, prevalence = 2/100)
+
+#create dataframe from phyloseq 
+FUNdf <- psmelt(pseq)
+
+###construct a stacked barplot showing relative abundance at 'Order' level
+#expand color palettes to fit data
+library(RColorBrewer)
+colourCount <- length(unique(FUNdf$Order))
+getPalette <- colorRampPalette(brewer.pal(9, "Paired"))
+
+#filter taxa by Abundance + merge "Unknown and Other" groups
+FUNdf$Order[FUNdf$Abundance < 0.1] <- "Taxa < 10% Abundant"
+FUNdf$Order[FUNdf$Order == "Unknown" | FUNdf$Order == "Other" | FUNdf$Order == "Taxa < 10% Abundant"] <- "Taxa < 10% Abundant"
+
+#plot the relative abundance by Order
+gg <- ggplot(FUNdf, aes(fill=Order, y=Abundance, x=Compartment)) + geom_bar(position="fill", stat="identity") + theme_minimal() + facet_grid(~Forest) + scale_fill_manual(values = getPalette(colourCount)) + ylab("Relative Abundance") + theme(axis.text.x = element_text(angle=45))
+
+#remove precursors from 'Order' designations in the plot legend
+gg1 <- ggplot(FUNdf, aes(fill=Order, y=Abundance, x=Compartment)) + geom_bar(position="fill", stat="identity") + theme_minimal() + facet_grid(~SWS) + scale_fill_manual(values = getPalette(colourCount)) + ylab("Relative Abundance") + theme(axis.text.x = element_text(angle=45))
+
+#change the y-axis to percent
+gg1 + scale_y_continuous(labels = scales::percent)
+```
+
+## Microbial Richness
+
+```{r}
+#set window dimensions
+par(mfrow=c(1,1))
+#par(mar=c(5,4,1,1))
+
+meta.data<-data.frame(sample_data(ITS_phyloseq_rarefied))
+fun.rich<-estimate_richness(ITS_phyloseq_rarefied)
+meta.data$ObsRich<-fun.rich$Observed
+
+boxplot(meta.data$ObsRich~meta.data$Forest,pch=21,cex=1.5, col=c("#8569D5", "#5E738F","#D1A33D"),
+     bg=c("#8569D5", "#5E738F","#D1A33D"), 
+     xlab="Forest Type",ylab="No. ASVs",las=1,bty="n")
+```
+
+
+## NOT FOR US: GAM for continuous x
+
+```{r, eval= FALSE}
+#this is modeling continuous numerical x value, not relevant for forest types
+rich.gam<-gam(ObsRich~s(Forest), data=meta.data); summary(rich.gam)
+gam.data<-data.frame(seq(0,36,by=0.1)); names(gam.data)<-"SampleAge"
+gam.line<-150+predict(rich.gam,type="terms",newdata=gam.data)
+lines(gam.line~gam.data$SampleAge,lwd=3)
+
+rich.mod<-lm(samp.data$ObsRich~samp.data$SampleAge+samp.data$Days2); summary(rich.mod)
+curve(213.971196 + 0.283215*x^2 - 13.568915*x,from=0,to=36,col="dark grey",add=TRUE,lwd=3)
+```
+
+
+## Rank Abundance Distributions
+
+These plots show relative abundance (y) against species rank (x) with the most abundant species ranked as 1, next abundance as 2, etc. This allows a visualisation of species richness (# species ranks on x axis) and species richness (slope of the line, steeper = less even). 
+
+```{r}
+#this step can take a long time
+named.ASV<-t(otu_table(ITS_phyloseq_rarefied))
+taxonomy.table<-data.frame(tax_table(ITS_phyloseq_rarefied))
+samp.data<-data.frame(sample_data(ITS_phyloseq_rarefied))
+meta.data$Forest.F<-as.factor(meta.data$Forest)
+
+ASV.names<-taxonomy.table$Species
+ASV.numbers<-paste("ASV",taxa_names(ITS_phyloseq_rarefied),sep="_")
+
+RankAbun1<-rankabundance(named.ASV) #this can take a while
+rankabunplot(RankAbun1,scale='logabun',addit=FALSE,specnames = c(1,2,3))
+invisible(rankabuncomp(named.ASV,y=meta.data,factor='Forest.F',scale='logabun',legend=FALSE,las=1)) #this also takes a while but it's cooool
+
+legend("topright",pch=21,legend=c("0","1","2","4","8","16","24","36"),col=rainbow(8),bty="n",ncol=2,cex=1)
+```
+
+## PERMANOVA
+
+Test whether there's a statistically significant difference between groups that we're testing. We can follow this with pairwise tests to check specific differences between groups. 
+
+```{r}
+#log transform
+physeq.t<-microbiome::transform(ITS_phyloseq_rarefied,transform="log10")
+#calculating bray curtis distances
+bray.dist<-phyloseq::distance(physeq.t,"bray") 
+samp.data<-sample_data(ITS_phyloseq_rarefied)
+
+#again, modeling
+physeq.model <-adonis2(bray.dist~samp.data$Forest); physeq.model
+
+#sometimes the effect of groups is only significant when there is log transformation, suggesting that the dominant taxa are fairly stable
+```
+
+## NMDS
+
+#### Without grouping
+
+```{r}
+#creating ordination
+forestOrd<-metaMDS(bray.dist,zero.dist="add",trymax=50)
+forestCoord<-forestOrd$points; forestCoord<-cbind(forestCoord,samp.data)
+
+#step by step plotting
+ordiplot(forestOrd,type="n",display="sites",cex=0.4)
+points(forestCoord[,1],forestCoord[,2],col="black", bg=c(heat.colors(n=9,alpha=0.5))[unclass(as.factor(forestCoord$Forest))],pch=21,cex=2,xlab="NMDS1",ylab="NMDS2")
+```
+
+#### Grouping by forest
+
+```{r}
+#dimensions
+#par(mfrow=c(2,1))
+#par(mar=c(5,4,1,1))
+
+#plot
+ordiplot(forestOrd,type="none",display="sites",cex=0.4,,las=1)
+points(forestCoord[,1],forestCoord[,2],col="black", bg=c(heat.colors(n=8,alpha=0.5))[unclass(as.factor(forestCoord$Forest))], pch=21,cex=2,xlab="NMDS1",ylab="NMDS2")
+
+ordihull(forestOrd, groups = forestCoord$Forest, col=c(heat.colors(n=8)),draw="polygon",lty='dotted')
+
+#get the centroids
+x.centroid<-aggregate(forestCoord$MDS1,by=list(forestCoord$Forest),FUN=mean)
+y.centroid<-aggregate(forestCoord$MDS2,by=list(forestCoord$Forest),FUN=mean)
+text(x.centroid$x,y.centroid$x,labels=x.centroid$Group.1,col="BLACK",cex=1)
+```
+
+## NOT FOR US: Adding lines for continuous data
+
+```{r, eval=FALSE}
+ordiplot(crapOrd,type="none",display="sites",cex=0.4)
+points(crapCoord[,1],crapCoord[,2],col=c("#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861","#652926", "#C84248")[unclass(as.factor(samp.data$PelletGroup))],
+       bg=c("#8569D550", "#5E738F80","#D1A33D80", "#8A7C6480", "#59986180","#65292680", "#C8424880")[unclass(as.factor(samp.data$PelletGroup))],pch=21,cex=2,xlab="NMDS1",ylab="NMDS2")
+
+text(crapCoord[,1],crapCoord[,2],labels=crapCoord$PelletGroup,col="BLACK",cex=0.7)
+
+for(i in 1:7){
+  
+  piles<-c("A","B","C","D","E","F","G")
+  line.color<-c("#8569D5", "#5E738F","#D1A33D", "#8A7C64", "#599861","#652926", "#C84248")
+  pile.sub<-subset(crapCoord,crapCoord$PelletGroup==piles[i])
+  pile.sub<-pile.sub[order(as.numeric(pile.sub$SampleAge)),]
+  lines(pile.sub[,1],pile.sub[,2],col=line.color[i],lty="dashed")
+  #arrows(pile.sub[4,1],pile.sub[4,2],pile.sub[5,1],pile.sub[5,2],col=line.color[i],lty="dashed",cex=0.5,length=0.1,code=2)
+  
+}
+```
+
+## Microshades
+
+This package (microshades) is nice to visualise nested taxonomical classifications. 
+
+```{r}
+#use microshades function prep_mdf to agglomerate, normalize, and melt the phyloseq object
+mdf_prep<-prep_mdf(ITS_phyloseq_rarefied,subgroup_level = "Genus")
+
+#create a color object for the specified data
+color_obj_v1v3_crap <- create_color_dfs(mdf_prep, group_level = "Phylum", subgroup_level = "Genus", selected_groups=c("p__Basidiomycota","p__Ascomycota","p__Mucoromycota") ,cvd = FALSE)
+
+#extract
+mdf_v1v3_crap <- color_obj_v1v3_crap$mdf
+cdf_v1v3_crap <- color_obj_v1v3_crap$cdf
+
+#plot
+
+plot_1 <- plot_microshades(mdf_v1v3_crap, cdf_v1v3_crap, group_label = "Phylum Genus")
+
+plot_1 + scale_y_continuous(labels = scales::percent, expand = expansion(0)) +
+  theme(legend.key.size = unit(0.2, "cm"), text=element_text(size=10)) +
+  theme(axis.text.x = element_text(size= 6)) + facet_wrap(~Forest)
+```
+
+## Compositional Plots
+
+```{r, fig.fullwidth=TRUE, fig.height=6, fig.width=15}
+#merge samples by category
+its_samples<-merge_samples(fun.ps,"Forest")
+sample_data(its_samples)$Forest = sample_names(its_samples)
+
+#aggregate samples by taxonomic rank (genus here)
+its_genus <- its_samples %>%
+  tax_glom(taxrank = "GENUS") %>%                     # agglomerate at genus level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% #transform to rel. abundance
+  psmelt() %>%                                         #melt to long format
+  filter(Abundance > 0.01) %>%                         #filter out low abundance taxa
+  arrange(Phylum)                                     #sort data frame alphabetically by phylum
+
+#a little setup work to create factors
+its_genus$Forest<-as.factor(its_genus$Forest)
+its_genus$Species<-as.character(its_genus$Genus)
+
+#replacing "NAs" in the taxonomy with "Unknown
+its_genus$Genus[which(its_genus$Genus=="g__")]<-"Unknown"
+
+#creating color palettes for the plotting.
+#these are some different choices I like but you can obviously 
+#choose your own depending on your specific dataset
+
+taxa_colors <- c("darkblue", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "lightskyblue", "darkgreen", "deeppink", "khaki2", "firebrick", "brown1", "darkorange1", "cyan1", "royalblue4", "darksalmon", "darkblue", "royalblue4", "dodgerblue3", "steelblue1", "lightskyblue", "darkseagreen", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "brown1", "darkorange1", "cyan1", "darkgrey", "darkblue", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "lightskyblue", "darkgreen", "deeppink", "khaki2", "firebrick", "brown1", "darkorange1", "cyan1", "royalblue4", "darksalmon", "darkblue", "royalblue4", "dodgerblue3", "steelblue1", "lightskyblue", "darkseagreen", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "brown1", "darkorange1", "cyan1", "darkgrey") 
+
+pal30 = c("#771155", "#AA4488", "#CC99BB", "#54278F", "#756BB1", "#9E9AC8", "#114477","#4477AA", "#77AADD", "#117777", "#44AAAA", "#77CCCC", "#117744", "#44AA77", "#88CCAA", "#777711", "#AAAA44", "#DDDD77", "#774411", "#AA7744", "#DDAA77", "#A63603", "#E6550D", "#FD8D3C", "#771122", "#AA4455", "#DD7788", "#252525", "#636363", "#969696")
+
+#matching the palettes to the size of the specific dataset
+n <- length(unique(its_genus$Species)) 
+
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+#making the plot using ggplots
+ggplot(its_genus, aes(x = Forest, y = Abundance, fill = GENUS)) + 
+  geom_bar(position="fill",stat = "identity") +
+  scale_fill_manual(values = col_vector) +
+  guides(fill = guide_legend(reverse = FALSE, keywidth = 1, keyheight = 1)) +
+  ylab("Relative Abundance (Genera > 1%) \n") +
+  xlab("Forest type") +
+  theme_minimal() + 
+  ggtitle("Composition of Fungi Genera Across Forest Types in Brunei and Singapore") + scale_y_continuous(labels = scales::percent) + # can change y axis to percentages (100%)
+  theme_bw()
+
+# functional guilds
+ITS_physeq[ITS_physeq == ''] <- NA
+ITS.df.clean <- subset(ITS_physeq, primary_lifestyle != "NA")
+ggplot(ITS.df.clean, aes(x = Forest, y = Abundance, fill = primary_lifestyle)) + 
+  geom_bar(position="fill",stat = "identity") +
+  scale_fill_manual(values = col_vector) +
+  guides(fill = guide_legend(reverse = FALSE, keywidth = 1, keyheight = 1)) +
+  ylab("Relative Abundance (Genera > 1%) \n") +
+  xlab("Forest type") +
+  theme_minimal() + 
+  ggtitle("Composition of Fungi Genera Across Forest Types in Brunei and Singapore") + scale_y_continuous(labels = scales::percent) + # can change y axis to percentages (100%)
+  theme_bw()
+
+#### can modify this for any taxononmic rank (or functional guild) you want
+
+
+```
+
+```{r, fig.fullwidth=TRUE, fig.height=6, fig.width=15}
+#repeat for family level
+its_family <- its_samples %>%
+  tax_glom(taxrank = "Family") %>%                     # agglomerate at family level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt() %>%                                         # Melt to long format
+  filter(Abundance > 0.01) %>%                         # Filter out low abundance taxa
+  arrange(Phylum)                                      # Sort data frame alphabetically by phylum
+
+its_family$Forest<-as.factor(its_family$Forest)
+its_family$Family<-as.character(its_family$Family)
+its_family$Family[which(its_family$Family=="f__")]<-"Unknown"
+
+taxa_colors <- c("darkblue", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "lightskyblue", "darkgreen", "deeppink", "khaki2", "firebrick", "brown1", "darkorange1", "cyan1", "royalblue4", "darksalmon", "darkblue", "royalblue4", "dodgerblue3", "steelblue1", "lightskyblue", "darkseagreen", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "brown1", "darkorange1", "cyan1", "darkgrey", "darkblue", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "lightskyblue", "darkgreen", "deeppink", "khaki2", "firebrick", "brown1", "darkorange1", "cyan1", "royalblue4", "darksalmon", "darkblue", "royalblue4", "dodgerblue3", "steelblue1", "lightskyblue", "darkseagreen", "darkgoldenrod1", "darkseagreen", "darkorchid", "darkolivegreen1", "brown1", "darkorange1", "cyan1", "darkgrey") 
+
+ggplot(its_family, aes(x = Forest, y = Abundance, fill = Family)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = taxa_colors) +
+  guides(fill = guide_legend(reverse = TRUE, keywidth = 1, keyheight = 1)) +
+  ylab("Relative Abundance (Families > 0.25%) \n") +
+  ggtitle("Composition of Fungi Families Across Forest Types in Brunei and Singapore") +
+  xlab("Forest") + theme_classic()
+```
+
+Notes:
+
+can combine bacteria and fungi databases based on name
+then can filter out specific dominant taxa per categorical variable
+
+can use one abundance of (bacteria for ex) to predict abundance of fungi
+also ratios of bacteria to fungi diversity
+
+normally they just use observed diversity rather than shannons or chaos or whatever index.
+
+```{Differential Abundance Analysis using DESeq2}
+## note: this is only for pairwise, so check literature what packages would be more relevant for interactions or multiple groups
+
+#subset phyloseq based on sample_data [Bulk soil vs. Endosphere]
+pseq.rare.BS.ES <- subset_samples(fun.ps, Forest == "S" | Forest == "MDF")
+
+#install
+#BiocManager::install("DESeq2")
+library(DESeq2)
+
+#convert phyloseq to DESeq2 format
+ddsFUN <- phyloseq_to_deseq2(pseq.rare.BS.ES, ~ Forest)
+
+#calculate size factors using edgeR
+library(edgeR)
+sizeFactors(ddsFUN) <- calcNormFactors(counts(ddsFUN))
+
+#run DESeq function
+ddsFUN = DESeq(ddsFUN, test="Wald", fitType="parametric")
+
+resFUN <- results(ddsFUN, cooksCutoff = FALSE)
+alpha = 0.1
+sigtabFUN <- resFUN[which(resFUN$padj < alpha), ]
+sigtabFUN <- cbind(as(sigtabFUN, "data.frame"), as(tax_table(pseq.rare.BS.ES)[rownames(sigtabFUN), ], "matrix"))
+
+
+
+x = tapply(sigtabFUN$log2FoldChange, sigtabFUN$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtabFUN$Phylum = factor(as.character(sigtabFUN$Phylum), levels=names(x))
+x = tapply(sigtabFUN$log2FoldChange, sigtabFUN$Genus, function(x) max(x))
+sigtabFUN$Genus = factor(as.character(sigtabFUN$Genus), levels=names(x))
+
+#plot [Bulk soil vs. Endosphere - All sites]
+sigtabFUN$Phylum <- factor(sigtabFUN$Phylum, levels = c("p__Ascomycota", "p__Basidiomycota", "p__Glomeromycota", "p__Mortierellomycota"))
+
+colnames(sigtabFUN) <- make.unique(names(sigtabFUN))
+sigtabFUN <- subset(sigtabFUN, Genus !="NA")
+
+ggplot(sigtabFUN, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=2, alpha = 0.7) + geom_point(size = 2, colour ="black", pch=21) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme_minimal() + coord_flip() + xlab("") + ylab("[Log2] Fold-Change") + theme(axis.text.y = element_text(size = 7)) + labs(title = "Differentially Abundant Fungal Genera [Bulk soil vs. Endosphere]") + theme(plot.title = element_text(size = 10))
+
+ggsave(
+    "ITS_test1.png",
+    plot = last_plot(),
+    device = NULL,
+    path = NULL,
+    scale = 1,
+    width = 5,
+    height = 12,
+    units = c("in"),
+    dpi = 300)
+
+###with guilds
+#order data and remove 'NAs'
+colnames(sigtabFUN) <- make.unique(names(sigtabFUN))
+sub.BSvES <- subset(sigtabFUN, Genus !="NA")
+library(RColorBrewer)
+getPalette <- colorRampPalette(brewer.pal(9, "Set1"))
+colourCount = length(unique(sub.BSvES$Class.1))
+
+#plot
+ggplot(sub.BSvES, aes(x=GENUS, y=log2FoldChange, color=jrk_template, shape=primary_lifestyle)) + geom_point(size=7, alpha = 0.7) + scale_shape_manual(values=c(15,16,17,18)) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme_minimal() + coord_flip() + xlab("") + ylab("[Log2] Fold-Change") + theme(axis.text.y = element_text(size = 7)) + labs(title = "Differentially Abundant Fungal Genera [Bulk soil vs. Endosphere]") + theme(plot.title = element_text(size = 10)) + scale_color_discrete("Phylum")
+```
+
+```{r}
+library(phyloseq)
+library(ggsci)
+
+#read in non-rarefied + non-transformed phyloseq
+pseq.non.rare <- readRDS("PHC-ITS1-FUNGI-PS.rds")
+# this will raise errors if you use the rarefied 
+
+#estimate richness based on samples
+funaDIV <- estimate_richness(pseq.non.rare)
+
+#export/save alpha diversity table 
+write.csv(funaDIV, "alphaDIV_FUNGi.csv")
+
+#plot alpha diversity
+plot_richness(pseq.non.rare, x = "Compartment", measures = c("Observed", "Chao1", "Shannon", "Fisher")) + theme_minimal() + xlab("") + geom_jitter(aes(fill=SWS), size = 2.5, colour="black", pch=21, stroke = 1.5, width = 0.2, alpha = 0.9) + theme(axis.text.x = element_text(angle = 45)) + labs(title = "Fungal Community") + labs(fill = "Site")
+
+#boxplot
+F2 <- plot_richness(pseq.non.rare, x = "SWS", color = "Compartment", measures = c("Observed", "Chao1", "Shannon", "Fisher")) + theme_minimal() + xlab("") + theme(axis.text.x = element_text(angle = 45)) + labs(title = "Fungal Community") + geom_boxplot()
+
+F2 + scale_color_manual(values= wes_palette("BottleRocket2", n=3))
+
+#anova test
+test <- psmelt(pseq.non.rare)
+anova_result <- aov(Abundance ~ SWS, test)
+summary(anova_result)
+
+anova_result2 <- aov(Abundance ~ Compartment, test)
+summary(anova_result2)
+
+#tukey test
+library(agricolae)
+
+tukey_result <- HSD.test(anova_result, "SWS", group = TRUE)
+print(tukey_result)
+
+tukey_result2 <- HSD.test(anova_result2, "Compartment", group = TRUE)
+print(tukey_result2)
+```
+
